@@ -1,0 +1,663 @@
+From 1744953e2e6be05c5e1d0d2cf7d78a38c9936f73 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 8 Oct 2026 14:43:47 +0000
+Subject: [PATCH] Answer replies from the dashboard
+
+The Replies tab gets a Reply button. It opens the whole conversation with
+that contact, read live from the account that emailed them (All Mail over
+IMAP), and a box that sends the answer from the same account over SMTP,
+threaded onto their latest message (Re: subject, In-Reply-To, References)
+with their message quoted underneath. Answering stops the contact's
+automatic follow-ups; dry-run mode logs it without sending.
+
+The inbox check now also records a further message from someone who
+already replied ("replied again": badge, log, Replies list) without
+counting a second reply, and matches replies to answers sent from the
+dashboard by their Message-ID.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0113TqZbbTbcvzU31k1eJLSB
+---
+ server/api/_engine.js    |  26 ++++++++-
+ server/api/_imap.js      |  97 +++++++++++++++++++++++++++++++
+ server/api/_inbox.js     | 120 +++++++++++++++++++++++++++++++++++++++
+ server/api/_replies.js   |   6 +-
+ server/api/admin.js      |   5 ++
+ server/public/app.css    |  14 +++++
+ server/public/app.js     |  91 +++++++++++++++++++++++++++--
+ server/public/index.html |   2 +-
+ server/test/run-all.mjs  | 118 ++++++++++++++++++++++++++++++++++++++
+ 9 files changed, 469 insertions(+), 10 deletions(-)
+ create mode 100644 server/api/_inbox.js
+
+diff --git a/server/api/_engine.js b/server/api/_engine.js
+index 079708c39776a381cbd3d349cc3ce125aa85d8f8..8c0cc7a817abb3b65ef9193210ce2a0c7516eace 100644
+--- a/server/api/_engine.js
++++ b/server/api/_engine.js
+@@ -1257,7 +1257,9 @@ export async function scanAccount(account, now = Date.now()) {
+       const chunk = list.slice(i, i + 300);
+       const recs = (await command('HMGET', K.sent, ...chunk)) || [];
+       recs.forEach((raw, j) => {
+-        for (const t of parse(raw)?.touches || []) {
++        const rec = parse(raw);
++        // Our emails and the answers sent from the dashboard.
++        for (const t of [...(rec?.touches || []), ...(rec?.answers || [])]) {
+           const id = msgIds(t.messageId)[0] || String(t.messageId || '').toLowerCase();
+           if (id && want.has(id)) map.set(id, chunk[j]);
+         }
+@@ -1273,11 +1275,13 @@ export async function scanAccount(account, now = Date.now()) {
+     await patchAccountState(account, { lastImapAt: now, lastImapError: msg });
+     throw new Error(`${account}: ${msg}`);
+   }
++  const later = [];   // people who already replied, writing again
+   let replies = 0, autoReplies = 0, bounces = 0;
+   const feed = [];
+   for (const r of found.replies) {
+     const rec = parse(await command('HGET', K.sent, r.email));
+-    if (!rec || rec.repliedAt || r.at < rec.firstSentAt) continue;
++    if (!rec || r.at < rec.firstSentAt) continue;
++    if (rec.repliedAt) { if (r.at > (rec.lastReplyAt || rec.repliedAt)) later.push(r); continue; }
+     rec.repliedAt = r.at;
+     rec.replySubject = r.subject || '';
+     if (r.from && r.from !== r.email) rec.replyFrom = r.from;
+@@ -1286,6 +1290,22 @@ export async function scanAccount(account, now = Date.now()) {
+     feed.push({ email: r.email, at: r.at, account, subject: r.subject || '', ...(rec.replyFrom ? { from: rec.replyFrom } : {}) });
+     replies++;
+   }
++  // A further message in a conversation that already counts as a reply: it
++  // changes no rate, but it is news (badge, log), and the dashboard shows
++  // whether it has been answered.
++  const newestLater = new Map();
++  for (const r of later) if (!(newestLater.get(r.email)?.at >= r.at)) newestLater.set(r.email, r);
++  let again = 0;
++  for (const r of newestLater.values()) {
++    const rec = parse(await command('HGET', K.sent, r.email));
++    if (!rec?.repliedAt || r.at <= (rec.lastReplyAt || rec.repliedAt)) continue;
++    rec.lastReplyAt = r.at;
++    rec.lastReplySubject = r.subject || '';
++    await command('HSET', K.sent, r.email, JSON.stringify(rec));
++    await addLog({ account, to: r.email, status: 'replied again', subject: r.subject, templateId: rec.template, ...(r.from && r.from !== r.email ? { from: r.from } : {}) });
++    feed.push({ email: r.email, at: r.at, account, subject: r.subject || '', again: true, ...(r.from && r.from !== r.email ? { from: r.from } : {}) });
++    again++;
++  }
+   // An out-of-office is not an answer: it is kept apart from the reply rate
+   // and does not stop the follow-ups.
+   for (const r of found.autoReplies || []) {
+@@ -1315,7 +1335,7 @@ export async function scanAccount(account, now = Date.now()) {
+   }
+   await patchAccountState(account, { lastImapAt: now, lastImapOkAt: now, lastImapError: null });
+   if (bounces) await checkBounceAutoPause(account, now);
+-  return { account, replies, autoReplies, bounces };
++  return { account, replies, autoReplies, bounces, ...(again ? { again } : {}) };
+ }
+ 
+ // Inboxes not checked in the last SCAN_EVERY_MIN minutes, oldest first.
+diff --git a/server/api/_imap.js b/server/api/_imap.js
+index aa978b2bf88b9fed5749ee7f7ed12c989070c091..84165b9f7e4d26c56abacdc72b0807395e03b7f9 100644
+--- a/server/api/_imap.js
++++ b/server/api/_imap.js
+@@ -116,3 +116,100 @@ export async function scanInbox(account, { since, known, threadOf = null }) {
+   }
+   return { replies, autoReplies, bounces: bounces.filter((b) => !b.soft), softBounces: bounces.filter((b) => b.soft) };
+ }
++
++// ------------------------------------------------------------------ one conversation
++//
++// Everything between this account and one contact in All Mail, both ways
++// (their replies and what we sent them), oldest first, as plain text. Read
++// live for the dashboard's conversation view; nothing is stored.
++
++const MAX_TEXT = 20000;
++
++const entity = (s) => s.replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
++  .replace(/&quot;/gi, '"').replace(/&#0*39;|&apos;/gi, "'").replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)));
++// Good enough for reading an email: block ends become line breaks, tags go.
++export function htmlToText(html) {
++  return entity(String(html || '')
++    .replace(/<(style|script|head)[^>]*>[\s\S]*?<\/\1>/gi, '')
++    .replace(/<br\s*\/?>/gi, '\n')
++    .replace(/<\/(p|div|tr|li|h\d|blockquote)>/gi, '\n')
++    .replace(/<[^>]+>/g, ''))
++    .replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
++}
++
++// The part to show: text/plain if there is one, else text/html; never an attachment.
++function textPart(node) {
++  let html = null;
++  const walk = (n) => {
++    if (!n) return null;
++    if (n.childNodes?.length) {
++      for (const c of n.childNodes) { const p = walk(c); if (p) return p; }
++      return null;
++    }
++    if (n.disposition === 'attachment') return null;
++    if (n.type === 'text/plain') return { part: n.part || '1', html: false };
++    if (n.type === 'text/html' && !html) html = { part: n.part || '1', html: true };
++    return null;
++  };
++  return walk(node) || html;
++}
++
++async function streamText(stream, max) {
++  let out = '';
++  for await (const chunk of stream) {
++    out += chunk.toString('utf8');
++    if (out.length > max * 4) break;
++  }
++  return out;
++}
++
++// addrs: the contact's addresses (the one we emailed, and the one they
++// answered from if different). since: ms.
++export async function readThread(account, addrs, { since, limit = 30 } = {}) {
++  const client = factory(account);
++  const self = String(account).toLowerCase();
++  const list = [...new Set(addrs.map((a) => String(a || '').toLowerCase()).filter(Boolean))];
++  await client.connect();
++  try {
++    const lock = await client.getMailboxLock(await mailboxOf(client), { readOnly: true });
++    try {
++      const who = list.flatMap((a) => [{ from: a }, { to: a }]);
++      const uids = (await client.search({ since: new Date(since), or: who }, { uid: true })) || [];
++      const recent = uids.slice(-limit);
++      const msgs = [];
++      if (recent.length) {
++        // Collected first: imapflow cannot run another command inside a fetch loop.
++        for await (const m of client.fetch(recent, { uid: true, envelope: true, internalDate: true, bodyStructure: true, headers: ['references'] }, { uid: true })) {
++          const from = m.envelope?.from?.[0] || {};
++          const h = headerMap(m.headers);
++          msgs.push({
++            uid: m.uid,
++            at: new Date(m.internalDate || m.envelope?.date || 0).getTime(),
++            from: String(from.address || '').toLowerCase(), fromName: from.name || '',
++            to: (m.envelope?.to || []).map((t) => String(t.address || '').toLowerCase()).filter(Boolean),
++            subject: String(m.envelope?.subject || ''),
++            messageId: m.envelope?.messageId || '',
++            references: msgIds(h.references).map((id) => `<${id}>`),
++            part: textPart(m.bodyStructure),
++          });
++        }
++      }
++      for (const m of msgs) {
++        let text = '';
++        if (m.part && typeof client.download === 'function') {
++          try {
++            const { content } = await client.download(m.uid, m.part.part, { uid: true, maxBytes: 2000000 });
++            const raw = await streamText(content, MAX_TEXT);
++            text = m.part.html ? htmlToText(raw) : raw.replace(/\r\n/g, '\n').trim();
++          } catch { text = ''; }
++        }
++        m.text = text.slice(0, MAX_TEXT);
++        m.ours = m.from === self;
++        delete m.part;
++      }
++      return msgs.sort((a, b) => a.at - b.at);
++    } finally { lock.release(); }
++  } finally {
++    await client.logout().catch(() => {});
++  }
++}
+diff --git a/server/api/_inbox.js b/server/api/_inbox.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..57c6a6cbfe9baf3bfac932a8521d8d58caa16631
+--- /dev/null
++++ b/server/api/_inbox.js
+@@ -0,0 +1,120 @@
++// Answering replies from the dashboard.
++//
++// conversation(email) reads the whole exchange with one contact live from the
++// account that emailed them (All Mail over IMAP: their replies and what we
++// sent), so the Replies tab can show it. answer({email, text}) sends a reply
++// from that same account over SMTP, threaded onto their latest message
++// (In-Reply-To / References, "Re:" subject), so it lands in the same Gmail
++// conversation on both sides; Gmail files it in the account's Sent mail.
++//
++// Writing to someone yourself stops their automatic follow-ups.
++import { command } from './_store.js';
++import { K, readSettings, hasPassword, passwordVar } from './_settings.js';
++import { readConfig } from './config.js';
++import { addLog, fromHeader, senderOf, withLock } from './_engine.js';
++import { normEmail } from './_render.js';
++import { transportFor } from './_smtp.js';
++import { readThread } from './_imap.js';
++
++const DAY = 86400000;
++const MAX_ANSWER = 20000;
++const parse = (s, d = null) => { try { return s ? JSON.parse(s) : d; } catch { return d; } };
++const bad = (msg, status = 400) => Object.assign(new Error(msg), { status });
++const asId = (id) => { const s = String(id || '').trim(); return !s ? '' : s.startsWith('<') ? s : `<${s}>`; };
++
++async function recordOf(email) {
++  const e = normEmail(email);
++  const rec = parse(await command('HGET', K.sent, e));
++  if (!rec) throw bad('the dashboard never emailed this address', 404);
++  if (!rec.account) throw bad('no sending account recorded for this contact');
++  return { e, rec };
++}
++
++const addrsOf = (e, rec) => [e, rec.replyFrom].filter(Boolean);
++// From a day before our first email, so the whole exchange is there.
++const sinceOf = (rec, now) => Math.min(now, Number(rec.firstSentAt) || now - 60 * DAY) - DAY;
++
++export async function conversation(email, now = Date.now()) {
++  const { e, rec } = await recordOf(email);
++  const account = rec.account;
++  const settings = await readSettings();
++  const config = await readConfig();
++  const { senderName } = senderOf(config, account);
++  const row = rec.row || {};
++  const base = {
++    email: e, account, senderName, name: row.name || [row.first_name, row.last_name].filter(Boolean).join(' '),
++    firstName: row.first_name || '', company: rec.company || row.company || '',
++    replyTo: rec.replyFrom || e, answers: rec.answers || [], dryRun: Boolean(settings.dryRun),
++  };
++  if (!hasPassword(account)) return { ...base, messages: [], error: `no app password set for ${account} (${passwordVar(account)})` };
++  try {
++    const messages = await readThread(account, addrsOf(e, rec), { since: sinceOf(rec, now) });
++    return { ...base, messages };
++  } catch (err) {
++    return { ...base, messages: [], error: `could not read ${account}'s mailbox: ${String(err?.responseText || err?.message || err).slice(0, 200)}` };
++  }
++}
++
++const reSubject = (s) => { const t = String(s || '').trim(); return /^re:/i.test(t) ? t : `Re: ${t}`; };
++const stamp = (ms) => new Date(ms).toLocaleString('en-GB', { timeZone: 'Africa/Nairobi', weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
++// Their message under ours, quoted the way mail apps do.
++export function quoted(m) {
++  if (!m?.text) return '';
++  const who = m.fromName ? `${m.fromName} <${m.from}>` : m.from;
++  const body = m.text.slice(0, 8000).split('\n').map((l) => (l.startsWith('>') ? `>${l}` : `> ${l}`)).join('\n');
++  return `\n\nOn ${stamp(m.at)}, ${who} wrote:\n${body}`;
++}
++
++export async function answer({ email, text, now = Date.now() } = {}) {
++  const body = String(text ?? '').replace(/\r\n/g, '\n');
++  if (!body.trim()) throw bad('write something to send');
++  if (body.length > MAX_ANSWER) throw bad(`keep it under ${MAX_ANSWER.toLocaleString('en-GB')} characters`);
++  const { e, rec } = await recordOf(email);
++  const account = rec.account;
++  const settings = await readSettings();
++  const dryRun = Boolean(settings.dryRun);
++  if (!dryRun && !hasPassword(account)) throw bad(`no app password set for ${account} (${passwordVar(account)})`);
++  const config = await readConfig();
++  const { senderName } = senderOf(config, account);
++
++  // Thread onto their latest message. If the mailbox can't be read, fall back
++  // to our last email to them and the subject of their reply.
++  let last = null;
++  try {
++    const msgs = await readThread(account, addrsOf(e, rec), { since: sinceOf(rec, now) });
++    last = [...msgs].reverse().find((m) => !m.ours) || null;
++  } catch { last = null; }
++  const touches = rec.touches || [];
++  const ours = asId(touches[touches.length - 1]?.messageId);
++  const parent = asId(last?.messageId) || ours;
++  const references = last ? [...(last.references || []), asId(last.messageId)].filter(Boolean) : [ours].filter(Boolean);
++  const to = last?.from || rec.replyFrom || e;
++  const subject = reSubject(last?.subject || rec.replySubject || rec.subject || '');
++  const mail = {
++    from: fromHeader(senderName, account), to, subject, text: body.trimEnd() + quoted(last),
++    ...(parent ? { inReplyTo: parent } : {}), ...(references.length ? { references: [...new Set(references)].slice(-20) } : {}),
++  };
++
++  const transport = transportFor(account, { dryRun });
++  let info;
++  try {
++    info = await transport.sendMail(mail);
++  } catch (err) {
++    const msg = String(err?.response || err?.message || err).slice(0, 300);
++    await addLog({ account, to, subject, status: 'answer failed', templateId: rec.template, error: msg });
++    throw bad(`send failed: ${msg}`, 502);
++  } finally { try { transport.close?.(); } catch { /* ignore */ } }
++
++  const messageId = info?.messageId || '';
++  await addLog({ account, to, subject, status: dryRun ? 'answered (dry-run)' : 'answered', templateId: rec.template, messageId,
++    response: String(info?.response || '').slice(0, 200) }, { subject, text: mail.text, from: account, plain: true });
++  // Under the lock: the inbox scan rewrites this record too.
++  await withLock(async () => {
++    const cur = parse(await command('HGET', K.sent, e)) || rec;
++    cur.answers = [...(cur.answers || []), { at: now, messageId, subject, ...(dryRun ? { dryRun: true } : {}) }].slice(-50);
++    cur.answeredAt = now;
++    await command('HSET', K.sent, e, JSON.stringify(cur));
++    await command('ZREM', K.fu, e);
++  }, { waitMs: 15000 });
++  return { ok: true, dryRun, to, subject, messageId, account };
++}
+diff --git a/server/api/_replies.js b/server/api/_replies.js
+index 770922bbadbc389101c3a7d4ba279c96ccf92cd4..34b39d6f36fe1d82e20ef216837fcee604af3f00 100644
+--- a/server/api/_replies.js
++++ b/server/api/_replies.js
+@@ -21,6 +21,10 @@ function rowOf(r, auto) {
+     at, auto, subject: (auto ? r.autoReplySubject : r.replySubject) || '', from: auto ? '' : (r.replyFrom || ''),
+     template: t.template || r.template, touch: t.n || before.length || 1, touches: touches.length,
+     sentAt: t.at || r.firstSentAt || null, firstSentAt: r.firstSentAt || null, personal: Boolean(touches[0]?.personal),
++    // The conversation since: their latest message, and when we last answered
++    // from the dashboard ("waiting" = they wrote after our last answer).
++    lastReplyAt: auto ? null : (r.lastReplyAt || null), latest: auto ? at : Math.max(at, r.lastReplyAt || 0),
++    answeredAt: r.answeredAt || null, answers: (r.answers || []).length,
+   };
+ }
+ 
+@@ -57,7 +61,7 @@ export async function listReplies({ kind = 'replies', q = '', limit = 200 } = {}
+   const needle = String(q || '').trim().toLowerCase();
+   const all = rows.length;
+   const out = (needle ? rows.filter((x) => `${x.email} ${x.name} ${x.company} ${x.account} ${x.subject} ${x.from}`.toLowerCase().includes(needle)) : rows)
+-    .sort((a, b) => b.at - a.at);
++    .sort((a, b) => b.latest - a.latest);
+   return { items: out.slice(0, Math.max(1, Math.min(1000, Number(limit) || 200))), matched: out.length, total: all };
+ }
+ 
+diff --git a/server/api/admin.js b/server/api/admin.js
+index dba9d33cc8423d58e3313ffa231df812b4f51762..e5b903c7726a772a8736279f963e92fa86674994 100644
+--- a/server/api/admin.js
++++ b/server/api/admin.js
+@@ -26,6 +26,7 @@ import { analytics } from './_analytics.js';
+ import { inventory, resetData } from './_reset.js';
+ import { purgePreview, purgeData } from './_purge.js';
+ import { listReplies, latestReplies } from './_replies.js';
++import { conversation, answer } from './_inbox.js';
+ 
+ const SAMPLE_ROW = {
+   email: 'sample@example.com', company: 'Sample Dental Ltd', first_name: 'Sam', name: 'Sam', vertical: 'dental',
+@@ -381,6 +382,10 @@ const actions = {
+   async 'scan.all'() { return withLock(() => scanAll(Date.now()), { waitMs: 15000 }); },
+   async 'replies.list'(b) { return listReplies({ kind: ['replies', 'auto', 'all'].includes(b.kind) ? b.kind : 'replies', q: b.q || '', limit: b.limit }); },
+   async 'replies.latest'() { return latestReplies(20); },
++  // The whole conversation with one contact, read live from the account that
++  // emailed them, and an answer sent from that same account (see _inbox.js).
++  async 'reply.thread'(b) { return conversation(b.email); },
++  async 'reply.send'(b) { return answer({ email: b.email, text: b.text }); },
+ 
+   // "Send test batch now": preview (no confirm) lists exactly who would get an
+   // email from which account; with confirm: [emails] it sends one per account,
+diff --git a/server/public/app.css b/server/public/app.css
+index ef43e6a0dcfa26d0e06681761ec813a8c299d73b..2facfefeb56013c603662a0e8c85ef5a01440b05 100644
+--- a/server/public/app.css
++++ b/server/public/app.css
+@@ -387,3 +387,17 @@ td.subj { max-width: 380px; overflow: hidden; text-overflow: ellipsis; }
+ .pz-cov .track div { height: 100%; background: var(--pz); border-radius: 0 4px 4px 0; }
+ .mail-subject { font-size: 15px; font-weight: 650; margin: 2px 0 10px; }
+ @media (max-width: 760px) { .pz-tiles, .pz-bars { grid-template-columns: 1fr; } .pz-row { grid-template-columns: 86px 1fr 48px; } }
++
++/* Conversation: answering a reply from the dashboard */
++.cv-list { display: flex; flex-direction: column; gap: 10px; max-height: 52vh; overflow: auto; padding: 2px; margin-bottom: 14px; }
++.cv-msg { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: var(--panel); max-width: 92%; }
++.cv-msg.ours { align-self: flex-end; background: var(--brand-soft); border-color: #dbe6ff; }
++.cv-h { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
++.cv-h .spacer { flex: 1; }
++.cv-subj { font-size: 12px; color: var(--text-2); margin-top: 2px; }
++.cv-body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13.5px; line-height: 1.55; margin-top: 8px; color: var(--text); }
++.cv-body.q { color: var(--text-2); font-size: 12.5px; border-left: 3px solid var(--line); padding-left: 10px; }
++.cv-msg details { margin-top: 6px; } .cv-msg summary { cursor: pointer; }
++.cv-compose { border-top: 1px solid var(--line); padding-top: 14px; }
++.cv-meta { font-size: 13px; margin-bottom: 8px; overflow-wrap: anywhere; }
++.cv-compose textarea { font-family: var(--font); font-size: 14px; line-height: 1.55; min-height: 170px; }
+diff --git a/server/public/app.js b/server/public/app.js
+index 3753d94f036e2283b2ad84230136c36bbffc8380..54ec992c10238c76f049ab01a1e9ea014b0667e1 100644
+--- a/server/public/app.js
++++ b/server/public/app.js
+@@ -43,9 +43,10 @@ const M = { sent: '#4f46e5', opened: '#f97316', replied: '#10b981', bounced: '#e
+ const PZ = '#7c3aed', STD = '#0d9488';
+ const pzPill = (on) => (on ? ' <span class="pill pz">personalised</span>' : '');
+ const STATUS_COLOR = { sent: '#10b981', 'dry-run': '#6366f1', skipped: '#f59e0b', deferred: '#fcd34d', failed: '#ef4444', bounced: '#991b1b',
+-  sending: '#2563eb', replied: '#0ea5e9', 'auto-reply': '#a5b4fc', test: '#94a3b8', 'test (dry-run)': '#cbd5e1', 'test failed': '#fca5a5' };
++  sending: '#2563eb', replied: '#0ea5e9', 'auto-reply': '#a5b4fc', test: '#94a3b8', 'test (dry-run)': '#cbd5e1', 'test failed': '#fca5a5',
++  'replied again': '#38bdf8', answered: '#14b8a6', 'answered (dry-run)': '#99f6e4', 'answer failed': '#fca5a5' };
+ const statusColor = (s) => STATUS_COLOR[s] || '#94a3b8';
+-const pillFor = (s) => (s === 'sent' || s === 'replied' ? 'ok' : /fail|bounce/.test(s) ? 'bad' : ['skipped', 'deferred'].includes(s) ? 'warn' : s === 'planned' || s === 'sending' ? 'info' : '');
++const pillFor = (s) => (s === 'sent' || s === 'replied' || s === 'replied again' || s === 'answered' ? 'ok' : /fail|bounce/.test(s) ? 'bad' : ['skipped', 'deferred'].includes(s) ? 'warn' : s === 'planned' || s === 'sending' ? 'info' : '');
+ const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+ const ICON = {
+   chart: '<svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 15l4-4 3 3 5-6"/></svg>',
+@@ -580,16 +581,17 @@ function renderReplies(id, items, { compact = false } = {}) {
+     return;
+   }
+   $(id).innerHTML = '<tr><th>Who</th><th>Replied</th><th>To our email</th><th>From account</th><th>Their subject</th><th></th></tr>' + items.map((x) => {
+-    const isNew = !x.auto && x.at > seen;
++    const isNew = !x.auto && (x.latest || x.at) > seen;
++    const again = x.lastReplyAt && x.lastReplyAt > (x.answeredAt || 0);
+     const who = [x.name, x.company].filter(Boolean).join(' · ');
+     return `<tr class="${isNew ? 'new' : ''}">
+       <td class="who"><b>${esc(who || x.email)}</b><span class="sub">${esc(x.email)}${x.from ? ` · answered from ${esc(x.from)}` : ''}</span></td>
+-      <td>${esc(when(x.at))}<div class="sub">${esc(ago(x.at))}${isNew ? ' <span class="pill ok">new</span>' : ''}${x.auto ? ' <span class="pill warn">out of office</span>' : ''}</div></td>
++      <td>${esc(when(x.at))}<div class="sub">${esc(ago(x.at))}${isNew ? ' <span class="pill ok">new</span>' : ''}${x.auto ? ' <span class="pill warn">out of office</span>' : ''}${again ? ` <span class="pill info" title="${esc(when(x.lastReplyAt))}">wrote again ${esc(ago(x.lastReplyAt))}</span>` : ''}${x.answeredAt && !again ? ` <span class="pill" title="${esc(when(x.answeredAt))}">answered</span>` : ''}</div></td>
+       <td><span class="dot" style="background:${segColor(x.template)};margin-right:6px"></span>${esc(TPL_LABEL[x.template] || x.template)}${x.touch > 1 ? ` · touch ${x.touch}` : ''}${pzPill(x.personal)}
+         <div class="sub">sent ${esc(when(x.sentAt))}${x.sentAt ? `, answered after ${esc(took(x.at, x.sentAt))}` : ''}</div></td>
+       <td><span class="dot" style="background:${acctColor(x.account)};margin-right:6px"></span>${esc(short(x.account))} ${lanePill(x.lane)}</td>
+       <td class="subj" title="${esc(x.subject)}">${esc(x.subject || '—')}</td>
+-      <td><a class="btn small" href="${esc(gmailLink(x))}" target="_blank" rel="noopener">Open in Gmail</a></td></tr>`;
++      <td style="white-space:nowrap"><button class="btn small primary" data-reply="${esc(x.email)}">Reply</button> <a class="btn small ghost" href="${esc(gmailLink(x))}" target="_blank" rel="noopener">Gmail</a></td></tr>`;
+   }).join('');
+ }
+ 
+@@ -659,6 +661,85 @@ async function pollReplies() {
+   } catch (e) { if (e instanceof AuthError) handleErr(e); }
+ }
+ 
++// ---------------------------------------------------------------- CONVERSATION (answer a reply without leaving the dashboard)
++// The whole exchange with one contact, read live from the account that
++// emailed them, and a reply box that sends from that account, threaded into
++// the same Gmail conversation. Drafts survive closing the window (this tab only).
++const drafts = new Map();
++document.addEventListener('click', (e) => { const b = e.target.closest('[data-reply]'); if (b) openConversation(b.dataset.reply); });
++
++// The new part of an email and the quoted history under it.
++function splitQuote(text) {
++  const lines = String(text || '').split('\n');
++  const wrote = (k) => /^On\b/.test(lines[k].trim()) && (/wrote:\s*$/.test(lines[k]) || /wrote:\s*$/.test(lines[k + 1] || ''));
++  const i = lines.findIndex((l, k) => k > 0 && (wrote(k) || /^-{2,}\s*Original Message/i.test(l.trim())
++    || (/^From:\s/.test(l) && /^(Sent|Date):\s/.test(lines[k + 1] || ''))
++    || (l.startsWith('>') && lines.slice(k).every((x) => !x.trim() || x.startsWith('>')))));
++  return i > 0 ? [lines.slice(0, i).join('\n').trimEnd(), lines.slice(i).join('\n')] : [String(text || ''), ''];
++}
++
++function messageHtml(m, d) {
++  const [main, quote] = splitQuote(m.text);
++  const who = m.ours ? `You <span class="sub">· ${esc(short(m.from))}</span>` : esc(m.fromName || m.from);
++  return `<div class="cv-msg${m.ours ? ' ours' : ''}">
++    <div class="cv-h"><b>${who}</b><span class="spacer"></span><span class="sub">${esc(when(m.at))}${m.justSent ? ' · just sent' : ''}</span></div>
++    ${m.subject ? `<div class="cv-subj">${esc(m.subject)}</div>` : ''}
++    <div class="cv-body">${main.trim() ? esc(main) : '<span class="sub">(no text: open it in Gmail to see this email)</span>'}</div>
++    ${quote ? `<details><summary class="sub">Quoted text</summary><div class="cv-body q">${esc(quote)}</div></details>` : ''}</div>`;
++}
++
++async function openConversation(email, { justSent = null } = {}) {
++  $('mTitle').innerHTML = `Conversation <span class="sub" style="font-weight:400">· ${esc(email)}</span>`;
++  if (!justSent) $('mBody').innerHTML = '<div class="sub">Reading the mailbox…</div>';
++  $('modal').classList.remove('hidden');
++  let d;
++  try { d = await api('reply.thread', { email }); }
++  catch (e) { if (e instanceof AuthError) return handleErr(e); $('mBody').innerHTML = bannerHtml('bad', 'Could not open the conversation', e.message); return; }
++  if ($('modal').classList.contains('hidden')) return;
++  const msgs = d.messages || [];
++  // Gmail can take a moment to file what we just sent; show it meanwhile.
++  if (justSent && !msgs.some((m) => m.ours && m.at >= justSent.at - 60000)) msgs.push({ ...justSent, ours: true, from: d.account, justSent: true });
++  const theirs = [...msgs].reverse().find((m) => !m.ours);
++  const subject = theirs?.subject ? (/^re:/i.test(theirs.subject) ? theirs.subject : `Re: ${theirs.subject}`) : '';
++  const to = theirs?.from || d.replyTo;
++  const sign = String(d.senderName || '').split(/\s+@\s+/)[0].trim();
++  const draft = drafts.get(email) ?? `Hi ${d.firstName || 'there'},\n\n\n\nBest,\n${sign}`;
++  const who = [d.name, d.company].filter(Boolean).join(' · ');
++  const noPw = /no app password/.test(d.error || '');
++  $('mBody').innerHTML = `
++    ${who ? `<p class="cap" style="margin:-4px 0 12px">${esc(who)}</p>` : ''}
++    ${d.error ? bannerHtml(noPw ? 'bad' : 'warn', noPw ? 'This account cannot send' : 'The mailbox could not be read', noPw ? d.error : `${d.error}. You can still reply: it is threaded onto our last email to them.`) : ''}
++    <div class="cv-list">${msgs.length ? msgs.map((m) => messageHtml(m, d)).join('') : (d.error ? '' : '<div class="sub">No messages found in the mailbox for this contact.</div>')}</div>
++    <div class="cv-compose">
++      ${d.dryRun ? bannerHtml('warn', 'Dry-run mode is on', 'The reply is written to the send log but not sent. Turn dry-run off on the Sending tab to send for real.') : ''}
++      <div class="cv-meta">From <b>${esc(d.account)}</b> to <b>${esc(to)}</b>${subject ? ` · <span class="sub">${esc(subject)}</span>` : ''}</div>
++      <textarea id="cvText" rows="9" aria-label="Your reply">${esc(draft)}</textarea>
++      <div class="row" style="margin-top:10px"><span class="sub">Their message is quoted underneath, as Gmail does. Replying stops this contact's automatic follow-ups. Ctrl+Enter sends.</span>
++        <span class="spacer" style="flex:1"></span><button class="btn primary" id="cvSend" ${noPw ? 'disabled' : ''}>${d.dryRun ? 'Log reply (dry run)' : 'Send reply'}</button></div>
++    </div>`;
++  const list = $('mBody').querySelector('.cv-list');
++  list.scrollTop = list.scrollHeight;
++  const ta = $('cvText');
++  ta.addEventListener('input', () => drafts.set(email, ta.value));
++  if (!drafts.has(email)) { const at = ta.value.indexOf('\n\n') + 2; ta.focus(); ta.setSelectionRange(at, at); }
++  const sendIt = async () => {
++    const btn = $('cvSend');
++    if (btn.disabled) return;
++    const text = ta.value;
++    if (!text.trim()) return toast('Write something first.');
++    btn.disabled = true; btn.textContent = 'Sending…';
++    try {
++      const r = await api('reply.send', { email, text });
++      drafts.delete(email);
++      toast(r.dryRun ? `Dry run: reply to ${r.to} logged, not sent.` : `Reply sent to ${r.to} from ${short(r.account)}.`);
++      await openConversation(email, { justSent: { at: Date.now(), subject: r.subject, text } });
++      if (current === 'replies' || current === 'overview') reload(true);
++    } catch (e) { handleErr(e); btn.disabled = false; btn.textContent = d.dryRun ? 'Log reply (dry run)' : 'Send reply'; }
++  };
++  $('cvSend').onclick = sendIt;
++  ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendIt(); } });
++}
++
+ // ---------------------------------------------------------------- TEMPLATES
+ let cfg = null, seg = 'callcenter', pvIndex = 0, pvTimer = null, dirty = false;
+ loaders.templates = async () => {
+diff --git a/server/public/index.html b/server/public/index.html
+index 488ed3c48b9594b71cfb0ee217c7c6e10ad72474..9d311284cc45c0332266f1212ededc05946736d2 100644
+--- a/server/public/index.html
++++ b/server/public/index.html
+@@ -286,7 +286,7 @@
+         <div class="card">
+           <div class="row" style="margin-bottom:14px">
+             <input id="lQ" placeholder="Search recipient, subject, error…" style="flex:1;min-width:220px">
+-            <select id="lStatus"><option value="">All statuses</option><option>sent</option><option>failed</option><option>bounced</option><option>skipped</option><option>deferred</option><option>dry-run</option><option>replied</option><option>auto-reply</option><option>test</option><option>test (dry-run)</option></select>
++            <select id="lStatus"><option value="">All statuses</option><option>sent</option><option>failed</option><option>bounced</option><option>skipped</option><option>deferred</option><option>dry-run</option><option>replied</option><option>replied again</option><option>answered</option><option>auto-reply</option><option>test</option><option>test (dry-run)</option></select>
+             <select id="lAcct"><option value="">All accounts</option></select>
+             <button class="btn primary" id="lGo">Search</button>
+           </div>
+diff --git a/server/test/run-all.mjs b/server/test/run-all.mjs
+index 14bb1219613f1a3ed4f7fb5a6c2c7edabe062009..d194f1a750218bc471aeb93b4ad701580df710e7 100644
+--- a/server/test/run-all.mjs
++++ b/server/test/run-all.mjs
+@@ -1844,6 +1844,124 @@ await reset();
+   await saveSettings({ paused: true });
+ }
+ 
++section('Answering replies from the dashboard: the conversation is read live, the answer threads into it, a second message is news');
++await reset();
++{
++  const A = ACCOUNTS[1], E1 = 'rita.reply@answerco.example', ALT = 'rita.personal@othermail.example';
++  const sentAt = EAT('2026-11-02', '10:00'), repliedAt = EAT('2026-11-03', '09:00');
++  const OUR_ID = '<our-first-0001@zemenay.example>', THEIR_ID = '<their-reply-0001@othermail.example>';
++  const row = { email: E1, company: 'Answer Co', first_name: 'Rita', last_name: 'Reply', vertical: 'dental', hours_gap: 'closed weekends' };
++  await command('HSET', S.K.sent, E1, JSON.stringify({ email: E1, account: A, company: row.company, row, template: 'callcenter',
++    touches: [{ at: sentAt, n: 1, t: 'answertoken000001', template: 'callcenter', messageId: OUR_ID }], firstSentAt: sentAt, lastSentAt: sentAt,
++    repliedAt, replySubject: 'Re: Quick question', replyFrom: ALT }));
++  await command('ZADD', S.K.byAcct(A), sentAt, E1);
++  await command('ZADD', S.K.fu, sentAt, E1);
++  await admin('account.add', { account: A, name: 'Brook @ ZemenayTech' }).catch(() => {});
++
++  // The account's All Mail: our first email (plain + html), their reply from
++  // another address (html only), and someone unrelated.
++  const box = [
++    { uid: 1, at: sentAt, from: A, name: 'Brook', to: E1, subject: 'Quick question', id: OUR_ID, refs: '', parts: { '1': 'Hi Rita,\n\nA quick question about weekends.', '2': '<p>Hi Rita</p>' } },
++    { uid: 2, at: repliedAt, from: ALT, name: 'Rita Reply', to: A, subject: 'Re: Quick question', id: THEIR_ID, refs: OUR_ID, html: true,
++      parts: { '1': '<div>Yes, tell me more &amp; send prices.<br>Thanks</div><div>On Mon, Brook wrote:<br>&gt; Hi Rita</div>' } },
++    { uid: 3, at: repliedAt, from: 'someone@else.example', name: '', to: A, subject: 'Unrelated', id: '<x@y>', refs: '', parts: { '1': 'nope' } },
++  ];
++  let imapDown = false;
++  const fakeBox = () => ({
++    async connect() { if (imapDown) throw new Error('IMAP login failed (test)'); }, async logout() {},
++    async list() { return [{ path: '[Gmail]/All Mail', specialUse: '\\All' }]; },
++    async getMailboxLock() { return { release() {} }; },
++    async search(q) {
++      const since = q.since ? q.since.getTime() : 0;
++      return box.filter((m) => m.at >= since - 86400000
++        && (!q.or || q.or.some((c) => (c.from && m.from === c.from) || (c.to && m.to === c.to)))
++        && (!q.not?.from || m.from !== q.not.from)).map((m) => m.uid);
++    },
++    async *fetch(uids) {
++      for (const m of box.filter((x) => uids.includes(x.uid))) {
++        yield { uid: m.uid, internalDate: new Date(m.at), envelope: { from: [{ address: m.from, name: m.name }], to: [{ address: m.to }], subject: m.subject, messageId: m.id },
++          headers: Buffer.from(m.refs ? `References: ${m.refs}\r\nIn-Reply-To: ${m.refs}\r\n` : ''),
++          bodyStructure: m.html ? { type: 'text/html' } : { type: 'multipart/alternative', childNodes: [{ type: 'text/plain', part: '1' }, { type: 'text/html', part: '2' }] } };
++      }
++    },
++    async download(uid, part) { const m = box.find((x) => x.uid === uid); return { content: (async function* () { yield Buffer.from(m.parts[part] || ''); })() }; },
++    async fetchOne() { return null; },
++  });
++  setImapFactory(fakeBox);
++
++  const th = (await admin('reply.thread', { email: 'Rita.Reply@answerco.example' })).json;
++  check('reply.thread reads both sides of the conversation, oldest first, and nothing unrelated',
++    th.messages?.length === 2 && th.messages[0].ours && !th.messages[1].ours && th.messages[1].from === ALT && th.account === A && th.replyTo === ALT, JSON.stringify(th).slice(0, 400));
++  check('it shows the text part, or the html as text when that is all there is',
++    th.messages[0].text === 'Hi Rita,\n\nA quick question about weekends.' && /^Yes, tell me more & send prices\.\nThanks\nOn Mon, Brook wrote:\n> Hi Rita$/.test(th.messages[1].text), JSON.stringify(th.messages.map((m) => m.text)));
++  check('it carries what the reply box needs (first name, sender name)', th.firstName === 'Rita' && th.dryRun === false && th.answers.length === 0);
++
++  const n0 = sim.sent.length;
++  sim.now = EAT('2026-11-03', '11:00');
++  const ans = await admin('reply.send', { email: E1, text: 'Hi Rita,\n\nPrices attached below.\n\nBest,\nBrook' });
++  const out = sim.sent.slice(n0);
++  const raw = out[0]?.raw || '';
++  check('reply.send sends one email from the same account, to the address they answered from', ans.status === 200 && out.length === 1 && out[0].account === A && out[0].to === ALT, JSON.stringify(ans.json));
++  check('it is threaded onto their message: Re: subject, In-Reply-To and References', /^Subject: Re: Quick question$/m.test(raw)
++    && new RegExp(`^In-Reply-To: ${THEIR_ID}$`, 'm').test(raw) && /^References: <our-first-0001@zemenay\.example>\s+<their-reply-0001@othermail\.example>$/m.test(raw.replace(/\n\s+/g, ' ')), raw.slice(0, 600));
++  check('it is plain text: what was typed, then their message quoted', out[0].mail.text.startsWith('Hi Rita,\n\nPrices attached below.\n\nBest,\nBrook\n\nOn ')
++    && /Rita Reply <rita\.personal@othermail\.example> wrote:\n> Yes, tell me more & send prices\.\n> Thanks/.test(out[0].mail.text) && !out[0].mail.html, out[0]?.mail.text);
++  const recA = JSON.parse(await command('HGET', S.K.sent, E1));
++  check('the answer is recorded on the contact and their follow-ups stop', recA.answers?.length === 1 && recA.answeredAt && recA.repliedAt === repliedAt
++    && (await command('ZSCORE', S.K.fu, E1)) === null);
++  const lg = (await admin('log.list', { status: 'answered' })).json.items;
++  check('the send log has it, with the full email', lg.length === 1 && lg[0].to === ALT && (await admin('log.get', { id: lg[0].id })).json.body?.text?.includes('Prices attached'));
++  const rl = (await admin('replies.list')).json.items.find((x) => x.email === E1);
++  check('the Replies list shows it answered', rl?.answeredAt === recA.answeredAt && rl.answers === 1 && !rl.lastReplyAt);
++
++  check('an empty answer, an unknown contact and a missing password are refused; it needs the admin password',
++    (await admin('reply.send', { email: E1, text: '   ' })).status === 400 && (await admin('reply.send', { email: 'nobody@x.example', text: 'hi' })).status === 404
++    && (await call(handlers.admin, { method: 'POST', body: { action: 'reply.send', email: E1, text: 'hi' } })).status === 401
++    && sim.sent.length === n0 + 1);
++  const pwVar = S.passwordVar(A), pw = process.env[pwVar];
++  delete process.env[pwVar];
++  const noPw = await admin('reply.send', { email: E1, text: 'hi' });
++  const thNoPw = (await admin('reply.thread', { email: E1 })).json;
++  process.env[pwVar] = pw;
++  check('without the account\'s app password nothing is sent and the conversation says why', noPw.status === 400 && /no app password/.test(noPw.json.error)
++    && /no app password/.test(thNoPw.error) && sim.sent.length === n0 + 1);
++
++  // The mailbox can't be read: still threaded, onto our own last email.
++  imapDown = true;
++  const thDown = (await admin('reply.thread', { email: E1 })).json;
++  const ans2 = await admin('reply.send', { email: E1, text: 'Following up on my last note.' });
++  const raw2 = sim.sent[sim.sent.length - 1].raw;
++  imapDown = false;
++  check('if the mailbox cannot be read, the conversation says so and a reply still threads onto our email', /could not read/.test(thDown.error) && ans2.status === 200
++    && new RegExp(`^In-Reply-To: ${OUR_ID}$`, 'm').test(raw2) && /^Subject: Re: Quick question$/m.test(raw2) && sim.sent[sim.sent.length - 1].to === ALT, raw2.slice(0, 400));
++
++  // Dry-run mode: logged, never sent.
++  await saveSettings({ dryRun: true });
++  const n1 = sim.sent.length;
++  const dry = await admin('reply.send', { email: E1, text: 'dry one' });
++  await saveSettings({ dryRun: false });
++  check('in dry-run mode the answer is logged but not sent', dry.status === 200 && dry.json.dryRun === true && sim.sent.length === n1
++    && (await admin('log.list', { status: 'answered (dry-run)' })).json.items.length === 1);
++
++  // They write again: news, but no second reply in the rates.
++  // From the other address, answering our dashboard answer (only its id in the headers).
++  box.push({ uid: 4, at: EAT('2026-11-04', '09:30'), from: ALT, name: 'Rita Reply', to: A, subject: 'Re: Quick question', id: '<their-reply-0002@othermail.example>', refs: recA.answers[0].messageId, parts: { '1': 'One more thing' } });
++  const sc = await E.scanAccount(A, EAT('2026-11-04', '10:00'));
++  const recB = JSON.parse(await command('HGET', S.K.sent, E1));
++  check('a second message from someone who already replied is recorded as "replied again", not as a new reply',
++    sc.replies === 0 && sc.again === 1 && recB.lastReplyAt === EAT('2026-11-04', '09:30') && recB.repliedAt === repliedAt, JSON.stringify(sc));
++  const rl2 = (await admin('replies.list')).json.items.find((x) => x.email === E1);
++  const feed = (await admin('replies.latest')).json;
++  check('it shows in the Replies list, the badge feed and the log', rl2.lastReplyAt === recB.lastReplyAt && rl2.latest === recB.lastReplyAt
++    && feed.items[0]?.again === true && feed.lastReplyAt === recB.lastReplyAt
++    && (await admin('log.list', { status: 'replied again' })).json.items.length === 1);
++  await E.scanAccount(A, EAT('2026-11-04', '10:15'));
++  check('scanning again does not record it twice', (await admin('log.list', { status: 'replied again' })).json.items.length === 1);
++  const an2 = (await admin('analytics')).json;
++  check('the reply rate still counts the contact once', an2.totals?.replied === 1 && an2.totals.contacts === 1, JSON.stringify(an2.totals || {}).slice(0, 200));
++  setImapFactory(() => ({ async connect() {}, async logout() {}, async getMailboxLock() { return { release() {} }; }, async search() { return []; }, async *fetch() {}, async fetchOne() { return null; } }));
++}
++
+ console.log(`\n${passes} passed, ${failures} failed`);
+ shim.close();
+ redis.kill();
+-- 
+2.43.0
+
